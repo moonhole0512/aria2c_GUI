@@ -4,7 +4,8 @@ import os
 import re
 import asyncio
 from threading import Thread
-import shutil # 추가
+import shutil
+import urllib.parse # 추가
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -280,8 +281,23 @@ class DownloaderUI(QMainWindow):
         if not url:
             QMessageBox.warning(self, "경고", "URL을 입력하세요.")
             return
-        
-        filename = os.path.basename(url.split("?", 1)[0]) or "download"
+
+        # 'rule34video.com' 링크에 대한 예외 처리
+        parsed_url = urllib.parse.urlparse(url)
+        if parsed_url.netloc == 'rule34video.com':
+            # 쿼리 파라미터에서 download_filename을 추출
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            if 'download_filename' in query_params:
+                filename = query_params['download_filename'][0]
+                # 다운로드 링크에서 쿼리 파라미터 제거
+                clean_url = parsed_url._replace(query='', params='').geturl()
+                url = clean_url
+            else:
+                filename = os.path.basename(parsed_url.path) or "download"
+        else:
+            # 일반적인 링크 처리
+            filename = os.path.basename(url.split("?", 1)[0]) or "download"
+
         row = self._append_row(url, "대기 중", 0, "", "")
         
         sig = DownloadSignals()
