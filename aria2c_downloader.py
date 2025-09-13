@@ -5,14 +5,16 @@ import re
 import asyncio
 from threading import Thread
 import shutil
-import urllib.parse # 추가
+import urllib.parse
+import json
+from functools import partial
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QFileDialog, QTableWidget, QTableWidgetItem,
     QLabel, QProgressBar, QHeaderView, QMessageBox, QSpinBox
 )
-from PySide6.QtCore import Qt, Signal, QObject
+from PySide6.QtCore import Qt, Signal, QObject, QSettings, QTimer
 import qdarkstyle
 
 # ---------------------------
@@ -160,6 +162,16 @@ class Aria2DownloadManager:
                 # 다운로드가 성공하면 파일을 최종 목적지로 이동
                 temp_path = os.path.join(self.temp_dir, filename)
                 try:
+                    # 파일이름이 이미 존재하는지 확인
+                    if os.path.exists(final_path):
+                        base, ext = os.path.splitext(final_path)
+                        i = 1
+                        new_path = f"{base}_{i}{ext}"
+                        while os.path.exists(new_path):
+                            i += 1
+                            new_path = f"{base}_{i}{ext}"
+                        final_path = new_path
+                        
                     shutil.move(temp_path, final_path)
                     signals.finished.emit(row, final_path)
                     signals.status.emit(row, "완료")
@@ -195,18 +207,24 @@ class DownloaderUI(QMainWindow):
         self.setWindowTitle("모던 aria2c 다운로드 매니저")
         self.resize(1000, 600)
 
-        # 기본 저장 경로
-        self.save_path = os.getcwd()
+        # QSettings 초기화: App을 설정하고, key, value 쌍으로 저장.
+        self.settings = QSettings("MyCompany", "Aria2Downloader")
+        
+        # 기본 저장 경로를 설정에서 불러오거나, 없으면 기본값으로 설정
+        self.save_path = self.settings.value("save_path", os.getcwd())
 
         # UI 위젯
         self._build_ui()
-
+        
         # signals per row
         self.signals_by_row = {}
 
         # manager: 동시 3개
         self.manager = Aria2DownloadManager(max_concurrent=3)
         self.manager.start()
+        
+        # 저장된 다운로드 목록 불러오기는 show() 이후에 호출되도록 수정
+        # self._load_saved_tasks() # 이 부분을 제거합니다.
 
     def _build_ui(self):
         central = QWidget()
@@ -263,12 +281,20 @@ class DownloaderUI(QMainWindow):
         layout.addLayout(footer)
 
         self.setCentralWidget(central)
+        
+    def show(self):
+        super().show()
+        # GUI가 표시된 후 (이벤트 루프가 시작된 후) 저장된 작업 로드
+        QTimer.singleShot(0, self._load_saved_tasks)
+
 
     def _choose_folder(self):
         path = QFileDialog.getExistingDirectory(self, "저장 경로 선택", self.save_path)
         if path:
             self.save_path = path
             self.path_label.setText(f"저장 경로: {self.save_path}")
+            # 경로 변경 시 설정에 저장
+            self.settings.setValue("save_path", self.save_path)
 
     def _change_concurrency(self, val):
         # 재시작 필요하면 재시작 로직을 추가해야 함.
@@ -281,40 +307,43 @@ class DownloaderUI(QMainWindow):
         if not url:
             QMessageBox.warning(self, "경고", "URL을 입력하세요.")
             return
+        
+        self._add_task(url, self.save_path)
+        self.url_input.clear()
 
-        # 'rule34video.com' 링크에 대한 예외 처리
+    def _get_filename_from_url(self, url):
         parsed_url = urllib.parse.urlparse(url)
         if parsed_url.netloc == 'rule34video.com':
-            # 쿼리 파라미터에서 download_filename을 추출
             query_params = urllib.parse.parse_qs(parsed_url.query)
             if 'download_filename' in query_params:
-                filename = query_params['download_filename'][0]
-                # 다운로드 링크에서 쿼리 파라미터 제거
-                clean_url = parsed_url._replace(query='', params='').geturl()
-                url = clean_url
-            else:
-                filename = os.path.basename(parsed_url.path) or "download"
-        else:
-            # 일반적인 링크 처리
-            filename = os.path.basename(url.split("?", 1)[0]) or "download"
-
+                return query_params['download_filename'][0]
+        
+        # 일반적인 링크 처리
+        filename = os.path.basename(parsed_url.path)
+        if not filename:
+             return "download" # 파일명이 없을 경우 기본값
+        
+        # 쿼리 파라미터가 있다면 제거 (split("?", 1)[0])
+        return filename.split("?", 1)[0]
+    
+    def _add_task(self, url, save_path):
+        filename = self._get_filename_from_url(url)
         row = self._append_row(url, "대기 중", 0, "", "")
         
         sig = DownloadSignals()
         
-        # 람다 함수를 사용하여 시그널과 슬롯 연결
-        sig.progress.connect(lambda row, p: self._on_progress(row, p))
-        sig.status.connect(lambda row, s: self._on_status(row, s))
-        sig.speed.connect(lambda row, s: self._on_speed(row, s))
-        sig.eta.connect(lambda row, e: self._on_eta(row, e))
-        sig.finished.connect(lambda row, p: self._on_finished(row, p))
-        sig.failed.connect(lambda row, e: self._on_failed(row, e))
+        # 시그널과 슬롯 연결 시, 시그널이 보내는 모든 인자를 람다 함수가 받아야 함
+        sig.progress.connect(lambda row_arg, p: self._on_progress(row_arg, p))
+        sig.status.connect(lambda row_arg, s: self._on_status(row_arg, s))
+        sig.speed.connect(lambda row_arg, s: self._on_speed(row_arg, s))
+        sig.eta.connect(lambda row_arg, e: self._on_eta(row_arg, e))
+        sig.finished.connect(lambda row_arg, p: self._on_finished(row_arg, p))
+        sig.failed.connect(lambda row_arg, e: self._on_failed(row_arg, e))
         
         self.signals_by_row[row] = sig
     
         try:
-            self.manager.add(row, url, self.save_path, filename, sig)
-            self.url_input.clear()
+            self.manager.add(row, url, save_path, filename, sig)
             self._on_status(row, "큐에 추가됨")
         except Exception as e:
             QMessageBox.critical(self, "오류", f"다운로드 추가 실패: {e}")
@@ -383,6 +412,32 @@ class DownloaderUI(QMainWindow):
         # remove from bottom up
         for r in reversed(to_remove):
             self.table.removeRow(r)
+            
+    # 프로그램 종료 시 미완료 항목 저장
+    def closeEvent(self, event):
+        tasks = []
+        for r in range(self.table.rowCount()):
+            status = self.table.item(r, 1).text()
+            if "완료" not in status and "실패" not in status:
+                url = self.table.item(r, 0).text()
+                tasks.append({"url": url, "save_path": self.save_path})
+        
+        self.settings.setValue("unfinished_tasks", json.dumps(tasks))
+        event.accept()
+        
+    # 프로그램 시작 시 저장된 미완료 항목 불러오기
+    def _load_saved_tasks(self):
+        try:
+            tasks_str = self.settings.value("unfinished_tasks")
+            if tasks_str:
+                tasks_str = str(tasks_str)
+                tasks = json.loads(tasks_str)
+                for task in tasks:
+                    self._add_task(task["url"], task["save_path"])
+                # 불러온 후 저장된 설정 초기화 (한번만 로드되도록)
+                self.settings.setValue("unfinished_tasks", "") 
+        except Exception as e:
+            print(f"Failed to load saved tasks: {e}")
 
 # ---------------------------
 # Main
