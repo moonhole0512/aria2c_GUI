@@ -4,7 +4,7 @@ import os
 import re
 import asyncio
 from threading import Thread
-from functools import partial
+import shutil # 추가
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -42,6 +42,11 @@ class Aria2DownloadManager:
         self.re_speed = re.compile(r'([\d\.]+(?:KiB|MiB|GiB)/s)')
         self.re_eta = re.compile(r'ETA\s+([0-9:\-]+)')  # ETA 00:01:23 or '-' sometimes
 
+        # 임시 다운로드 폴더
+        self.temp_dir = "temp"
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+
     def start(self):
         if self.running:
             return
@@ -74,7 +79,7 @@ class Aria2DownloadManager:
     async def _run_aria2(self, job):
         # job: (row, url, folder, filename, signals)
         row, url, folder, filename, signals = job
-        outpath = os.path.join(folder, filename)
+        final_path = os.path.join(folder, filename)
 
         # Build aria2c command
         # -x 16 -s 16 -c : multi-connection + resume
@@ -88,7 +93,7 @@ class Aria2DownloadManager:
             "--summary-interval=1",
             "--max-tries=5",
             "--retry-wait=5",
-            "-d", folder,
+            "-d", self.temp_dir,  # 임시 폴더로 변경
             "-o", filename,
             url
         ]
@@ -149,8 +154,18 @@ class Aria2DownloadManager:
                 signals.progress.emit(row, 100)
                 signals.speed.emit(row, "")
                 signals.eta.emit(row, "00:00:00")
-                signals.finished.emit(row, outpath)
-                signals.status.emit(row, "완료")
+                signals.status.emit(row, "다운로드 완료, 파일 이동 중...")
+
+                # 다운로드가 성공하면 파일을 최종 목적지로 이동
+                temp_path = os.path.join(self.temp_dir, filename)
+                try:
+                    shutil.move(temp_path, final_path)
+                    signals.finished.emit(row, final_path)
+                    signals.status.emit(row, "완료")
+                except Exception as e:
+                    signals.failed.emit(row, f"파일 이동 실패: {e}")
+                    signals.status.emit(row, "이동 실패")
+
             else:
                 signals.failed.emit(row, f"aria2c 실패 (코드 {rc})")
                 signals.status.emit(row, f"실패 (코드 {rc})")
@@ -271,7 +286,7 @@ class DownloaderUI(QMainWindow):
         
         sig = DownloadSignals()
         
-        # 람다 함수를 사용하여 시그널과 슬롯 연결을 올바르게 수정
+        # 람다 함수를 사용하여 시그널과 슬롯 연결
         sig.progress.connect(lambda row, p: self._on_progress(row, p))
         sig.status.connect(lambda row, s: self._on_status(row, s))
         sig.speed.connect(lambda row, s: self._on_speed(row, s))
