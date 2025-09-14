@@ -328,6 +328,15 @@ class DownloaderUI(QMainWindow):
     
     def _add_task(self, url, save_path):
         filename = self._get_filename_from_url(url)
+        final_path = os.path.join(save_path, filename)
+
+        # 중복 파일 확인 로직 추가
+        if os.path.exists(final_path):
+            QMessageBox.information(
+                self, "알림", f"'{filename}' 파일이 이미 존재합니다. 다운로드를 취소합니다."
+            )
+            return
+        
         row = self._append_row(url, "대기 중", 0, "", "")
         
         sig = DownloadSignals()
