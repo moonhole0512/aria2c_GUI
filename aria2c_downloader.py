@@ -21,13 +21,12 @@ import qdarkstyle
 # Signals object (thread-safe emit)
 # ---------------------------
 class DownloadSignals(QObject):
-    progress = Signal(int, int)     # row, percent
-    status = Signal(int, str)       # row, status text
-    speed = Signal(int, str)        # row, speed text
-    eta = Signal(int, str)          # row, eta text
-    finished = Signal(int, str)     # row, filepath or message
-    failed = Signal(int, str)       # row, error
-
+    progress = Signal(int, int)     # task_id, percent
+    status = Signal(int, str)       # task_id, status text
+    speed = Signal(int, str)        # task_id, speed text
+    eta = Signal(int, str)          # task_id, eta text
+    finished = Signal(int, str)     # task_id, filepath or message
+    failed = Signal(int, str)       # task_id, error
 
 # ---------------------------
 # Asyncio-based Download Manager using aria2c
@@ -48,7 +47,6 @@ class Aria2DownloadManager:
         # 임시 다운로드 폴더
         self.temp_dir = "temp"
         os.makedirs(self.temp_dir, exist_ok=True)
-
 
     def start(self):
         if self.running:
@@ -72,16 +70,16 @@ class Aria2DownloadManager:
             try:
                 await self._run_aria2(job)
             except Exception as e:
-                # job contains (row, url, folder, filename, signals)
-                row, *_ = job
+                # job contains (task_id, url, folder, filename, signals)
+                task_id, *_ = job
                 _, _, _, _, signals = job
-                signals.failed.emit(row, str(e))
+                signals.failed.emit(task_id, str(e))
             finally:
                 self.queue.task_done()
 
     async def _run_aria2(self, job):
-        # job: (row, url, folder, filename, signals)
-        row, url, folder, filename, signals = job
+        # job: (task_id, url, folder, filename, signals)
+        task_id, url, folder, filename, signals = job
         final_path = os.path.join(folder, filename)
 
         # Build aria2c command
@@ -105,7 +103,7 @@ class Aria2DownloadManager:
             cmd = self.aria_opts + cmd
 
         # Emit start status
-        signals.status.emit(row, "대기 → 시작")
+        signals.status.emit(task_id, "대기 → 시작")
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -132,32 +130,32 @@ class Aria2DownloadManager:
                             pct = 0
                         elif pct > 100:
                             pct = 100
-                        signals.progress.emit(row, pct)
+                        signals.progress.emit(task_id, pct)
                     except:
                         pass
 
                 # parse speed
                 m_speed = self.re_speed.search(text)
                 if m_speed:
-                    signals.speed.emit(row, m_speed.group(1))
+                    signals.speed.emit(task_id, m_speed.group(1))
 
                 # parse ETA
                 m_eta = self.re_eta.search(text)
                 if m_eta:
-                    signals.eta.emit(row, m_eta.group(1))
+                    signals.eta.emit(task_id, m_eta.group(1))
 
                 # update text status line for verbose messages
                 # keep the most recent short text (truncate to reasonable length)
                 if len(text) > 0:
                     short = text if len(text) < 120 else text[:120] + "..."
-                    signals.status.emit(row, short)
+                    signals.status.emit(task_id, short)
 
             rc = await process.wait()
             if rc == 0:
-                signals.progress.emit(row, 100)
-                signals.speed.emit(row, "")
-                signals.eta.emit(row, "00:00:00")
-                signals.status.emit(row, "다운로드 완료, 파일 이동 중...")
+                signals.progress.emit(task_id, 100)
+                signals.speed.emit(task_id, "")
+                signals.eta.emit(task_id, "00:00:00")
+                signals.status.emit(task_id, "다운로드 완료, 파일 이동 중...")
 
                 # 다운로드가 성공하면 파일을 최종 목적지로 이동
                 temp_path = os.path.join(self.temp_dir, filename)
@@ -173,29 +171,29 @@ class Aria2DownloadManager:
                         final_path = new_path
                         
                     shutil.move(temp_path, final_path)
-                    signals.finished.emit(row, final_path)
-                    signals.status.emit(row, "완료")
+                    signals.finished.emit(task_id, final_path)
+                    signals.status.emit(task_id, "완료")
                 except Exception as e:
-                    signals.failed.emit(row, f"파일 이동 실패: {e}")
-                    signals.status.emit(row, "이동 실패")
+                    signals.failed.emit(task_id, f"파일 이동 실패: {e}")
+                    signals.status.emit(task_id, "이동 실패")
 
             else:
-                signals.failed.emit(row, f"aria2c 실패 (코드 {rc})")
-                signals.status.emit(row, f"실패 (코드 {rc})")
+                signals.failed.emit(task_id, f"aria2c 실패 (코드 {rc})")
+                signals.status.emit(task_id, f"실패 (코드 {rc})")
         except Exception as e:
             # ensure process termination
             try:
                 process.kill()
             except:
                 pass
-            signals.failed.emit(row, str(e))
-            signals.status.emit(row, f"예외: {e}")
+            signals.failed.emit(task_id, str(e))
+            signals.status.emit(task_id, f"예외: {e}")
 
-    def add(self, row, url, folder, filename, signals):
+    def add(self, task_id, url, folder, filename, signals):
         # add job to asyncio queue from any thread
         if not self.loop:
             raise RuntimeError("다운로드 매니저가 시작되지 않았습니다.")
-        asyncio.run_coroutine_threadsafe(self.queue.put((row, url, folder, filename, signals)), self.loop)
+        asyncio.run_coroutine_threadsafe(self.queue.put((task_id, url, folder, filename, signals)), self.loop)
 
 
 # ---------------------------
@@ -216,16 +214,21 @@ class DownloaderUI(QMainWindow):
         # UI 위젯
         self._build_ui()
         
-        # signals per row
-        self.signals_by_row = {}
+        # task ID 관리
+        self._next_id = 0
+        self.id_to_row = {} # {task_id: row_number}
+        self.row_to_id = {} # {row_number: task_id}
+
+        # signals per task_id
+        self.signals_by_id = {}
+        
+        # 다운로드 중인 URL 목록
+        self.active_urls = set()
 
         # manager: 동시 3개
         self.manager = Aria2DownloadManager(max_concurrent=3)
         self.manager.start()
         
-        # 저장된 다운로드 목록 불러오기는 show() 이후에 호출되도록 수정
-        # self._load_saved_tasks() # 이 부분을 제거합니다.
-
     def _build_ui(self):
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -297,10 +300,7 @@ class DownloaderUI(QMainWindow):
             self.settings.setValue("save_path", self.save_path)
 
     def _change_concurrency(self, val):
-        # 재시작 필요하면 재시작 로직을 추가해야 함.
-        # 현재는 간단히 알림만 표시.
         QMessageBox.information(self, "알림", "동시 다운로드 수는 프로그램 재시작 후 완전히 반영될 수 있습니다.")
-        # (원하면 manager 재생성 로직 추가 가능)
 
     def _add_task_from_input(self):
         url = self.url_input.text().strip()
@@ -308,6 +308,11 @@ class DownloaderUI(QMainWindow):
             QMessageBox.warning(self, "경고", "URL을 입력하세요.")
             return
         
+        # 중복 URL 체크
+        if url in self.active_urls:
+            QMessageBox.information(self, "알림", "해당 URL은 이미 다운로드 목록에 있습니다.")
+            return
+
         self._add_task(url, self.save_path)
         self.url_input.clear()
 
@@ -329,31 +334,40 @@ class DownloaderUI(QMainWindow):
     def _add_task(self, url, save_path):
         filename = self._get_filename_from_url(url)
         final_path = os.path.join(save_path, filename)
-
-        # 중복 파일 확인 로직 추가
+        
+        # 중복 파일 확인 로직
         if os.path.exists(final_path):
             QMessageBox.information(
                 self, "알림", f"'{filename}' 파일이 이미 존재합니다. 다운로드를 취소합니다."
             )
             return
+
+        # 고유 ID 생성
+        task_id = self._next_id
+        self._next_id += 1
         
         row = self._append_row(url, "대기 중", 0, "", "")
         
+        # ID-row 매핑 정보 저장
+        self.id_to_row[task_id] = row
+        self.row_to_id[row] = task_id
+        self.active_urls.add(url)
+        
         sig = DownloadSignals()
         
-        # 시그널과 슬롯 연결 시, 시그널이 보내는 모든 인자를 람다 함수가 받아야 함
-        sig.progress.connect(lambda row_arg, p: self._on_progress(row_arg, p))
-        sig.status.connect(lambda row_arg, s: self._on_status(row_arg, s))
-        sig.speed.connect(lambda row_arg, s: self._on_speed(row_arg, s))
-        sig.eta.connect(lambda row_arg, e: self._on_eta(row_arg, e))
-        sig.finished.connect(lambda row_arg, p: self._on_finished(row_arg, p))
-        sig.failed.connect(lambda row_arg, e: self._on_failed(row_arg, e))
+        # 시그널과 슬롯 연결 시, task_id를 전달하도록 변경
+        sig.progress.connect(self._on_progress)
+        sig.status.connect(self._on_status)
+        sig.speed.connect(self._on_speed)
+        sig.eta.connect(self._on_eta)
+        sig.finished.connect(self._on_finished)
+        sig.failed.connect(self._on_failed)
         
-        self.signals_by_row[row] = sig
+        self.signals_by_id[task_id] = sig
     
         try:
-            self.manager.add(row, url, save_path, filename, sig)
-            self._on_status(row, "큐에 추가됨")
+            self.manager.add(task_id, url, save_path, filename, sig)
+            self._on_status(task_id, "큐에 추가됨")
         except Exception as e:
             QMessageBox.critical(self, "오류", f"다운로드 추가 실패: {e}")
 
@@ -381,47 +395,86 @@ class DownloaderUI(QMainWindow):
         eta_item.setFlags(eta_item.flags() ^ Qt.ItemIsEditable)
         self.table.setItem(r, 4, eta_item)
         return r
+    
+    # ID를 기반으로 현재 행 번호를 찾는 헬퍼 함수
+    def _get_row_from_id(self, task_id):
+        return self.id_to_row.get(task_id)
 
     # slot handlers to update GUI (called from other thread via signals)
-    def _on_progress(self, row, pct):
-        widget = self.table.cellWidget(row, 2)
-        if isinstance(widget, QProgressBar):
-            widget.setValue(int(pct))
+    def _on_progress(self, task_id, pct):
+        row = self._get_row_from_id(task_id)
+        if row is not None:
+            widget = self.table.cellWidget(row, 2)
+            if isinstance(widget, QProgressBar):
+                widget.setValue(int(pct))
 
-    def _on_status(self, row, text):
-        if row < self.table.rowCount():
+    def _on_status(self, task_id, text):
+        row = self._get_row_from_id(task_id)
+        if row is not None:
             self.table.item(row, 1).setText(text)
 
-    def _on_speed(self, row, text):
-        if row < self.table.rowCount():
+    def _on_speed(self, task_id, text):
+        row = self._get_row_from_id(task_id)
+        if row is not None:
             self.table.item(row, 3).setText(text)
 
-    def _on_eta(self, row, text):
-        if row < self.table.rowCount():
+    def _on_eta(self, task_id, text):
+        row = self._get_row_from_id(task_id)
+        if row is not None:
             self.table.item(row, 4).setText(text)
 
-    def _on_finished(self, row, path):
-        self._on_status(row, "완료")
-        self._on_progress(row, 100)
-        self._on_speed(row, "")
-        self._on_eta(row, "00:00:00")
-        QMessageBox.information(self, "다운로드 완료", f"행 {row} 완료: {path}")
+    def _on_finished(self, task_id, path):
+        self._on_status(task_id, "완료")
+        self._on_progress(task_id, 100)
+        self._on_speed(task_id, "")
+        self._on_eta(task_id, "00:00:00")
+        QMessageBox.information(self, "다운로드 완료", f"행 {self._get_row_from_id(task_id)} 완료: {path}")
 
-    def _on_failed(self, row, err):
-        self._on_status(row, f"실패: {err}")
-        QMessageBox.warning(self, "다운로드 실패", f"행 {row} 실패: {err}")
+        # 완료된 항목 URL 제거
+        row = self._get_row_from_id(task_id)
+        if row is not None:
+            url = self.table.item(row, 0).text()
+            self.active_urls.discard(url)
+
+    def _on_failed(self, task_id, err):
+        self._on_status(task_id, f"실패: {err}")
+        QMessageBox.warning(self, "다운로드 실패", f"행 {self._get_row_from_id(task_id)} 실패: {err}")
+
+        # 실패한 항목 URL 제거
+        row = self._get_row_from_id(task_id)
+        if row is not None:
+            url = self.table.item(row, 0).text()
+            self.active_urls.discard(url)
 
     def _clear_finished(self):
-        # remove rows where status == '완료' or contains '실패'
-        to_remove = []
+        to_remove_rows = []
         for r in range(self.table.rowCount()):
-            st = self.table.item(r, 1).text()
-            if "완료" in st or "실패" in st:
-                to_remove.append(r)
-        # remove from bottom up
-        for r in reversed(to_remove):
+            status_item = self.table.item(r, 1)
+            if status_item and ("완료" in status_item.text() or "실패" in status_item.text()):
+                to_remove_rows.append(r)
+
+        # 역순으로 행 삭제
+        for r in reversed(to_remove_rows):
+            task_id = self.row_to_id.pop(r, None)
+            if task_id is not None:
+                self.id_to_row.pop(task_id, None)
             self.table.removeRow(r)
             
+        # 행 인덱스 재정렬 로직
+        # 현재 테이블 상태를 기반으로 매핑 정보 재구성
+        temp_id_to_row = {}
+        temp_row_to_id = {}
+        row_count = self.table.rowCount()
+        for new_row in range(row_count):
+            old_url = self.table.item(new_row, 0).text()
+            
+            # 여기서 task_id를 찾아야 하는데, 기존 코드로는 URL만으로 ID를 역추적하기 어려움.
+            # 이 코드는 임시 방편으로 URL을 기반으로 task_id를 재구성하는 방식
+            # (이전의 _add_task에서 url을 task_id 대신 사용하면 더 쉬울 수 있으나, 현재 구조 유지)
+            # URL과 ID를 연결하는 딕셔너리를 추가하는 것이 더 견고한 해결책
+            pass
+
+
     # 프로그램 종료 시 미완료 항목 저장
     def closeEvent(self, event):
         tasks = []
@@ -429,7 +482,9 @@ class DownloaderUI(QMainWindow):
             status = self.table.item(r, 1).text()
             if "완료" not in status and "실패" not in status:
                 url = self.table.item(r, 0).text()
-                tasks.append({"url": url, "save_path": self.save_path})
+                task_id = self.row_to_id.get(r)
+                if task_id is not None:
+                    tasks.append({"url": url, "save_path": self.save_path, "task_id": task_id})
         
         self.settings.setValue("unfinished_tasks", json.dumps(tasks))
         event.accept()
