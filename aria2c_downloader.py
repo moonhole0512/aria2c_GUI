@@ -94,6 +94,7 @@ class Aria2DownloadManager:
             "--summary-interval=1",
             "--max-tries=5",
             "--retry-wait=5",
+            "--auto-file-renaming=false",
             "-d", self.temp_dir,  # 임시 폴더로 변경
             "-o", filename,
             url
@@ -195,6 +196,32 @@ class Aria2DownloadManager:
             raise RuntimeError("다운로드 매니저가 시작되지 않았습니다.")
         asyncio.run_coroutine_threadsafe(self.queue.put((task_id, url, folder, filename, signals)), self.loop)
 
+# ---------------------------
+# Notification Widget
+# ---------------------------
+class NotificationLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.BypassWindowManagerHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("""
+            background-color: rgba(30, 30, 30, 200);
+            color: #ffffff;
+            border-radius: 8px;
+            padding: 10px;
+        """)
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.hide)
+
+    def show_message(self, message, duration=3000):
+        self.setText(message)
+        self.adjustSize()
+        # Position the notification at the bottom right corner of the main window
+        parent_rect = self.parent().geometry()
+        self.move(parent_rect.right() - self.width() - 20, parent_rect.bottom() - self.height() - 20)
+        self.show()
+        self.hide_timer.start(duration)
 
 # ---------------------------
 # GUI Application
@@ -211,6 +238,9 @@ class DownloaderUI(QMainWindow):
         # 기본 저장 경로를 설정에서 불러오거나, 없으면 기본값으로 설정
         self.save_path = self.settings.value("save_path", os.getcwd())
 
+        # Notification Label 추가
+        self.notification_label = NotificationLabel(self)
+
         # UI 위젯
         self._build_ui()
         
@@ -218,6 +248,9 @@ class DownloaderUI(QMainWindow):
         self._next_id = 0
         self.id_to_row = {} # {task_id: row_number}
         self.row_to_id = {} # {row_number: task_id}
+        
+        # --- 추가: task_id에 해당하는 URL을 저장할 딕셔너리 ---
+        self.url_by_id = {}
 
         # signals per task_id
         self.signals_by_id = {}
@@ -264,7 +297,8 @@ class DownloaderUI(QMainWindow):
 
         # table: URL | 상태 | progress bar | speed | ETA
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["URL", "상태", "진행률", "속도", "ETA"])
+        # --- 수정: "URL"을 "파일명"으로 변경합니다. ---
+        self.table.setHorizontalHeaderLabels(["파일명", "상태", "진행률", "속도", "ETA"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
@@ -305,12 +339,12 @@ class DownloaderUI(QMainWindow):
     def _add_task_from_input(self):
         url = self.url_input.text().strip()
         if not url:
-            QMessageBox.warning(self, "경고", "URL을 입력하세요.")
+            self.notification_label.show_message("경고: URL을 입력하세요.")
             return
         
         # 중복 URL 체크
         if url in self.active_urls:
-            QMessageBox.information(self, "알림", "해당 URL은 이미 다운로드 목록에 있습니다.")
+            self.notification_label.show_message("알림: 해당 URL은 이미 다운로드 목록에 있습니다.")
             return
 
         self._add_task(url, self.save_path)
@@ -330,15 +364,15 @@ class DownloaderUI(QMainWindow):
         
         # 쿼리 파라미터가 있다면 제거 (split("?", 1)[0])
         return filename.split("?", 1)[0]
-    
+
+    # 버그 수정: 최종 경로에 파일이 존재할 경우에만 중복 체크
     def _add_task(self, url, save_path):
         filename = self._get_filename_from_url(url)
         final_path = os.path.join(save_path, filename)
-        
-        # 중복 파일 확인 로직
+
         if os.path.exists(final_path):
-            QMessageBox.information(
-                self, "알림", f"'{filename}' 파일이 이미 존재합니다. 다운로드를 취소합니다."
+            self.notification_label.show_message(
+                f"알림: '{filename}' 파일이 이미 존재합니다. 다운로드를 취소합니다."
             )
             return
 
@@ -346,16 +380,19 @@ class DownloaderUI(QMainWindow):
         task_id = self._next_id
         self._next_id += 1
         
-        row = self._append_row(url, "대기 중", 0, "", "")
+        row = self._append_row(filename, "대기 중", 0, "", "")
         
         # ID-row 매핑 정보 저장
         self.id_to_row[task_id] = row
         self.row_to_id[row] = task_id
+        
+        # URL 정보도 별도로 저장
+        self.url_by_id[task_id] = url
         self.active_urls.add(url)
         
         sig = DownloadSignals()
         
-        # 시그널과 슬롯 연결 시, task_id를 전달하도록 변경
+        # 시그널과 슬롯 연결
         sig.progress.connect(self._on_progress)
         sig.status.connect(self._on_status)
         sig.speed.connect(self._on_speed)
@@ -369,38 +406,67 @@ class DownloaderUI(QMainWindow):
             self.manager.add(task_id, url, save_path, filename, sig)
             self._on_status(task_id, "큐에 추가됨")
         except Exception as e:
-            QMessageBox.critical(self, "오류", f"다운로드 추가 실패: {e}")
+            self.notification_label.show_message(f"오류: 다운로드 추가 실패: {e}")
 
-    def _append_row(self, url, status, pct, speed_text, eta_text):
+    # 추가된 메서드: 이어받기용. 파일 존재 여부 체크를 하지 않습니다.
+    def _add_task_on_resume(self, url, save_path):
+        filename = self._get_filename_from_url(url)
+        
+        # 고유 ID 생성
+        task_id = self._next_id
+        self._next_id += 1
+        
+        row = self._append_row(filename, "대기 중", 0, "", "")
+        
+        # ID-row 매핑 정보 저장
+        self.id_to_row[task_id] = row
+        self.row_to_id[row] = task_id
+        
+        # URL 정보도 별도로 저장
+        self.url_by_id[task_id] = url
+        self.active_urls.add(url)
+        
+        sig = DownloadSignals()
+        
+        # 시그널과 슬롯 연결
+        sig.progress.connect(self._on_progress)
+        sig.status.connect(self._on_status)
+        sig.speed.connect(self._on_speed)
+        sig.eta.connect(self._on_eta)
+        sig.finished.connect(self._on_finished)
+        sig.failed.connect(self._on_failed)
+        
+        self.signals_by_id[task_id] = sig
+    
+        try:
+            self.manager.add(task_id, url, save_path, filename, sig)
+            self._on_status(task_id, "큐에 추가됨")
+        except Exception as e:
+            self.notification_label.show_message(f"오류: 다운로드 추가 실패: {e}")
+
+    def _append_row(self, filename, status, pct, speed_text, eta_text):
         r = self.table.rowCount()
         self.table.insertRow(r)
-        # URL
-        url_item = QTableWidgetItem(url)
-        url_item.setFlags(url_item.flags() ^ Qt.ItemIsEditable)
-        self.table.setItem(r, 0, url_item)
-        # Status
+        filename_item = QTableWidgetItem(filename)
+        filename_item.setFlags(filename_item.flags() ^ Qt.ItemIsEditable)
+        self.table.setItem(r, 0, filename_item)
         status_item = QTableWidgetItem(status)
         status_item.setFlags(status_item.flags() ^ Qt.ItemIsEditable)
         self.table.setItem(r, 1, status_item)
-        # ProgressBar in column 2
         pb = QProgressBar()
         pb.setValue(int(pct))
         self.table.setCellWidget(r, 2, pb)
-        # speed
         sp_item = QTableWidgetItem(speed_text)
         sp_item.setFlags(sp_item.flags() ^ Qt.ItemIsEditable)
         self.table.setItem(r, 3, sp_item)
-        # eta
         eta_item = QTableWidgetItem(eta_text)
         eta_item.setFlags(eta_item.flags() ^ Qt.ItemIsEditable)
         self.table.setItem(r, 4, eta_item)
         return r
     
-    # ID를 기반으로 현재 행 번호를 찾는 헬퍼 함수
     def _get_row_from_id(self, task_id):
         return self.id_to_row.get(task_id)
 
-    # slot handlers to update GUI (called from other thread via signals)
     def _on_progress(self, task_id, pct):
         row = self._get_row_from_id(task_id)
         if row is not None:
@@ -428,68 +494,77 @@ class DownloaderUI(QMainWindow):
         self._on_progress(task_id, 100)
         self._on_speed(task_id, "")
         self._on_eta(task_id, "00:00:00")
-        QMessageBox.information(self, "다운로드 완료", f"행 {self._get_row_from_id(task_id)} 완료: {path}")
+        
+        self.notification_label.show_message(f"다운로드 완료: 행 {self._get_row_from_id(task_id)} - {path}")
 
-        # 완료된 항목 URL 제거
-        row = self._get_row_from_id(task_id)
-        if row is not None:
-            url = self.table.item(row, 0).text()
+        url = self.url_by_id.get(task_id)
+        if url:
             self.active_urls.discard(url)
 
     def _on_failed(self, task_id, err):
         self._on_status(task_id, f"실패: {err}")
-        QMessageBox.warning(self, "다운로드 실패", f"행 {self._get_row_from_id(task_id)} 실패: {err}")
+        
+        self.notification_label.show_message(f"다운로드 실패: 행 {self._get_row_from_id(task_id)} - {err}")
 
-        # 실패한 항목 URL 제거
-        row = self._get_row_from_id(task_id)
-        if row is not None:
-            url = self.table.item(row, 0).text()
+        url = self.url_by_id.get(task_id)
+        if url:
             self.active_urls.discard(url)
 
     def _clear_finished(self):
-        to_remove_rows = []
+        unfinished_tasks = []
         for r in range(self.table.rowCount()):
             status_item = self.table.item(r, 1)
-            if status_item and ("완료" in status_item.text() or "실패" in status_item.text()):
-                to_remove_rows.append(r)
-
-        # 역순으로 행 삭제
-        for r in reversed(to_remove_rows):
-            task_id = self.row_to_id.pop(r, None)
-            if task_id is not None:
-                self.id_to_row.pop(task_id, None)
-            self.table.removeRow(r)
-            
-        # 행 인덱스 재정렬 로직
-        # 현재 테이블 상태를 기반으로 매핑 정보 재구성
-        temp_id_to_row = {}
-        temp_row_to_id = {}
-        row_count = self.table.rowCount()
-        for new_row in range(row_count):
-            old_url = self.table.item(new_row, 0).text()
-            
-            # 여기서 task_id를 찾아야 하는데, 기존 코드로는 URL만으로 ID를 역추적하기 어려움.
-            # 이 코드는 임시 방편으로 URL을 기반으로 task_id를 재구성하는 방식
-            # (이전의 _add_task에서 url을 task_id 대신 사용하면 더 쉬울 수 있으나, 현재 구조 유지)
-            # URL과 ID를 연결하는 딕셔너리를 추가하는 것이 더 견고한 해결책
-            pass
-
-
-    # 프로그램 종료 시 미완료 항목 저장
-    def closeEvent(self, event):
-        tasks = []
-        for r in range(self.table.rowCount()):
-            status = self.table.item(r, 1).text()
-            if "완료" not in status and "실패" not in status:
-                url = self.table.item(r, 0).text()
+            if status_item and "완료" not in status_item.text() and "실패" not in status_item.text():
                 task_id = self.row_to_id.get(r)
                 if task_id is not None:
-                    tasks.append({"url": url, "save_path": self.save_path, "task_id": task_id})
+                    url = self.url_by_id.get(task_id)
+                    unfinished_tasks.append({
+                        "task_id": task_id,
+                        "url": url,
+                        "filename": self.table.item(r, 0).text(),
+                        "status": status_item.text(),
+                        "progress_value": self.table.cellWidget(r, 2).value() if self.table.cellWidget(r, 2) else 0,
+                        "speed": self.table.item(r, 3).text(),
+                        "eta": self.table.item(r, 4).text()
+                    })
+
+        self.table.setRowCount(0)
+        self.id_to_row.clear()
+        self.row_to_id.clear()
+        self.url_by_id.clear()
+        self.active_urls.clear()
         
-        self.settings.setValue("unfinished_tasks", json.dumps(tasks))
+        for task_data in unfinished_tasks:
+            r = self._append_row(
+                task_data['filename'], 
+                task_data['status'], 
+                task_data['progress_value'], 
+                task_data['speed'], 
+                task_data['eta']
+            )
+            self.id_to_row[task_data['task_id']] = r
+            self.row_to_id[r] = task_data['task_id']
+            self.url_by_id[task_data['task_id']] = task_data['url']
+            self.active_urls.add(task_data['url'])
+            
+            self._on_status(task_data['task_id'], "큐에 추가됨")
+
+    def closeEvent(self, event):
+        tasks = []
+        for task_id, url in self.url_by_id.items():
+            row = self.id_to_row.get(task_id)
+            if row is not None:
+                status = self.table.item(row, 1).text()
+                if "완료" not in status and "실패" not in status:
+                    tasks.append({"url": url, "save_path": self.save_path})
+        
+        try:
+            self.settings.setValue("unfinished_tasks", json.dumps(tasks))
+        except Exception as e:
+            self.notification_label.show_message(f"오류: 프로그램 상태 저장 실패: {e}")
+            
         event.accept()
         
-    # 프로그램 시작 시 저장된 미완료 항목 불러오기
     def _load_saved_tasks(self):
         try:
             tasks_str = self.settings.value("unfinished_tasks")
@@ -497,11 +572,11 @@ class DownloaderUI(QMainWindow):
                 tasks_str = str(tasks_str)
                 tasks = json.loads(tasks_str)
                 for task in tasks:
-                    self._add_task(task["url"], task["save_path"])
-                # 불러온 후 저장된 설정 초기화 (한번만 로드되도록)
+                    # 버그 수정: 재시작 시에는 파일 존재 여부 검사 없이 재개
+                    self._add_task_on_resume(task["url"], task["save_path"])
                 self.settings.setValue("unfinished_tasks", "") 
         except Exception as e:
-            print(f"Failed to load saved tasks: {e}")
+            self.notification_label.show_message(f"오류: 저장된 다운로드 목록을 불러오지 못했습니다. {e}")
 
 # ---------------------------
 # Main
